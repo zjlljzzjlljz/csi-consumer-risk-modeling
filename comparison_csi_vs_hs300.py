@@ -39,7 +39,7 @@ def calculate_metrics(
     normalized = prices / prices.iloc[0]
     drawdown = normalized / normalized.cummax() - 1.0
     total_return = normalized.iloc[-1] - 1.0
-    max_drawdown = drawdown.min()
+    max_drawdown = drawdown.apply(lambda s: s.min())
 
     years = (normalized.index[-1] - normalized.index[0]).days / 365.25
     annualized_return = (normalized.iloc[-1] ** (1.0 / years)) - 1.0
@@ -68,6 +68,7 @@ def plot_comparison(normalized: pd.DataFrame, drawdown: pd.DataFrame) -> None:
 
     axes[1].xaxis.set_major_locator(mdates.YearLocator(1))
     axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    axes[1].set_xlim(normalized.index.min(), normalized.index.max())
     fig.autofmt_xdate(rotation=45)
 
     plt.tight_layout()
