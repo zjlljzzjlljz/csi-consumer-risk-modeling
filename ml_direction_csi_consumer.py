@@ -13,27 +13,12 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report
 
+from modules.core import CSI_CONSUMER_SYMBOL, compute_rsi, fetch_index_daily
 
-INDEX_SYMBOL = "sz399932"
+
 START_DATE = "2009-01-01"
 TRAIN_END_DATE = "2023-12-31"
 FEATURE_COLS = ["lag_ret_1", "lag_ret_3", "lag_ret_5", "lag_ret_10", "vol_5d", "rsi_14", "pe_percentile_10y"]
-
-
-def fetch_index_data(symbol: str, start_date: str) -> pd.DataFrame:
-    """Fetch index daily data from AkShare and return cleaned DataFrame."""
-    df = ak.stock_zh_index_daily(symbol=symbol)
-    if df.empty:
-        raise RuntimeError(f"No data returned for {symbol}.")
-
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna(subset=["date", "close"]).sort_values("date")
-    df = df[df["date"] >= pd.Timestamp(start_date)].reset_index(drop=True)
-    if df.empty:
-        raise RuntimeError(f"{symbol} has no valid data after {start_date}.")
-    return df
 
 
 def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
@@ -139,7 +124,7 @@ def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
         time.sleep(1)
 
     # 4) Final manual proxy from CSI Consumer index price itself.
-    idx = fetch_index_data(INDEX_SYMBOL, start_date)
+    idx = fetch_index_daily(CSI_CONSUMER_SYMBOL, start_date)
     ma_idx = idx["close"].rolling(120, min_periods=20).mean()
     discount_factor = 0.97
     idx["pe_ttm"] = idx["close"] / (ma_idx * discount_factor)
@@ -149,18 +134,6 @@ def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
     print("Source: Trend-based Proxy PE")
     print("Successfully bypassed 404 using [Trend-based Proxy PE]")
     return idx
-
-
-def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    """Compute RSI using exponential moving averages."""
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
 
 
 def build_features(df: pd.DataFrame, pe_df: pd.DataFrame) -> pd.DataFrame:
@@ -365,7 +338,7 @@ def print_feature_importance(imp_df: pd.DataFrame | None) -> None:
 
 
 def main() -> None:
-    raw = fetch_index_data(INDEX_SYMBOL, START_DATE)
+    raw = fetch_index_daily(CSI_CONSUMER_SYMBOL, START_DATE)
     pe_df = fetch_consumer_pe_series(START_DATE)
     data = build_features(raw, pe_df)
     check_no_lookahead_bias(data)

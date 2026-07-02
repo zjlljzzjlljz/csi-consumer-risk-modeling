@@ -7,43 +7,26 @@ from datetime import date
 from pathlib import Path
 import warnings
 
-# Silence optional pandas dependency version warnings without changing calculations.
 warnings.filterwarnings("ignore", message=r".*Pandas requires version '.*' or newer of 'numexpr'.*")
 warnings.filterwarnings("ignore", message=r".*Pandas requires version '.*' or newer of 'bottleneck'.*")
 
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
-import akshare as ak
+
+from modules.core import CSI_CONSUMER_SYMBOL, HS300_SYMBOL, fetch_index_daily
 
 
-CONSUMER_SYMBOL = "sz399932"
-HS300_SYMBOL = "sh000300"
 START_DATE = "2005-01-01"
-
-
-def fetch_index_close(symbol: str, start_date: str) -> pd.Series:
-    """Fetch daily close series for a Chinese index from AkShare."""
-    df = ak.stock_zh_index_daily(symbol=symbol)
-    if df.empty:
-        raise RuntimeError(f"No data returned for {symbol}.")
-
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna(subset=["date", "close"]).set_index("date").sort_index()
-    df = df[df.index >= pd.Timestamp(start_date)]
-    if df.empty:
-        raise RuntimeError(f"{symbol} has no data after {start_date}.")
-    return df["close"].rename(symbol)
 
 
 def build_aligned_prices(start_date: str) -> pd.DataFrame:
     """Build aligned price DataFrame using date intersection."""
-    consumer = fetch_index_close(CONSUMER_SYMBOL, start_date)
-    hs300 = fetch_index_close(HS300_SYMBOL, start_date)
+    consumer = fetch_index_daily(CSI_CONSUMER_SYMBOL, start_date)
+    hs300 = fetch_index_daily(HS300_SYMBOL, start_date)
+    consumer = consumer.set_index("date")["close"].rename("CSI Consumer Index (sz399932)")
+    hs300 = hs300.set_index("date")["close"].rename("CSI 300 Index (sh000300)")
     prices = pd.concat([consumer, hs300], axis=1, join="inner").dropna(how="any")
-    prices.columns = ["CSI Consumer Index (sz399932)", "CSI 300 Index (sh000300)"]
     if prices.empty:
         raise RuntimeError("No overlapping dates between the two indices after alignment.")
     return prices
