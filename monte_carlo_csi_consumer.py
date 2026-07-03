@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Monte Carlo simulation for CSI Consumer Index (sz399932) with GARCH vol linkage,
-DCA scenario comparison, and historical simulation benchmark."""
+regime-switching GBM, DCA scenario comparison, strategic allocation, VaR/CVaR backtesting,
+and historical simulation benchmark."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import matplotlib.dates as mdates
@@ -19,6 +20,7 @@ from modules.core import (
     estimate_annual_params,
     fetch_index_daily,
     garch_fit_and_forecast,
+    garch_regime_labels,
 )
 
 HISTORY_START = "2005-01-01"
@@ -32,6 +34,7 @@ INVESTMENT_MONTHS = 10
 TOTAL_INVESTMENT = MONTHLY_INVESTMENT * INVESTMENT_MONTHS
 
 RNG_SEED = 42
+VAR_LEVELS = [0.95, 0.99]
 
 
 @dataclass
@@ -46,6 +49,10 @@ class SimulationStats:
     ci_low_pl: float
     ci_high_pl: float
     total_investment: float
+    var_95: float = np.nan
+    cvar_95: float = np.nan
+    var_99: float = np.nan
+    cvar_99: float = np.nan
 
 
 def run_monte_carlo(
@@ -92,6 +99,149 @@ def run_monte_carlo(
     return months, portfolio_paths
 
 
+def run_regime_switching_mc(
+    annual_mean_return: float,
+    annual_volatility: float,
+    n_paths: int,
+    start_date: str,
+    end_date: str,
+    monthly_investment: float,
+    investment_months: int,
+    regime_vols: dict[int, float],
+    transition_matrix: np.ndarray,
+    initial_regime: int = 0,
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+    """Simulate portfolio paths with two-regime Markov-switching GBM.
+
+    Args:
+        regime_vols: {0: low_vol, 1: high_vol} — annualized vol for each regime
+        transition_matrix: 2×2 Markov transition matrix P[i,j] = P(state j | state i)
+        initial_regime: starting regime (0 or 1)
+    Returns:
+        months, portfolio_paths, regime_paths (n_steps × n_paths of regime labels)
+    """
+    months = pd.date_range(start=start_date, end=end_date, freq="ME")
+    n_steps = len(months)
+    if n_steps <= 0:
+        raise RuntimeError("Simulation horizon has zero monthly steps.")
+
+    rng = np.random.default_rng(RNG_SEED)
+    shocks = rng.standard_normal((n_steps, n_paths))
+    regime_draws = rng.uniform(0, 1, (n_steps, n_paths))
+
+    portfolio_paths = np.zeros((n_steps, n_paths), dtype=float)
+    regime_paths = np.zeros((n_steps, n_paths), dtype=int)
+    portfolio = np.zeros(n_paths, dtype=float)
+    current_regime = np.full(n_paths, initial_regime, dtype=int)
+
+    for t in range(n_steps):
+        if t < investment_months:
+            portfolio += monthly_investment
+
+        vol_path = np.array([regime_vols[r] for r in current_regime], dtype=float)
+        monthly_mu_log = (annual_mean_return - 0.5 * vol_path**2) / 12.0
+        monthly_sigma_log = vol_path / np.sqrt(12.0)
+        growth_factors = np.exp(monthly_mu_log + monthly_sigma_log * shocks[t])
+        portfolio *= growth_factors
+        portfolio_paths[t] = portfolio
+        regime_paths[t] = current_regime
+
+        # Markov transition: for each path, if uniform draw < P(stay), stay; else switch
+        stay_probs = np.array([transition_matrix[r, r] for r in current_regime])
+        switch = regime_draws[t] > stay_probs
+        current_regime = np.where(switch, 1 - current_regime, current_regime)
+
+    return months, portfolio_paths, regime_paths
+
+
+def run_strategy_mc(
+    annual_mean_return: float,
+    annual_volatility: float,
+    n_paths: int,
+    start_date: str,
+    end_date: str,
+    monthly_contribution: float,
+    investment_months: int,
+    total_budget: float,
+) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray, np.ndarray]:
+    """MC with valuation-driven allocation and OU mean-reverting PE signal.
+
+    Simulates a PE percentile path following an Ornstein-Uhlenbeck process
+    (mean-reverts to 0.50 with half-life ~2 years). When PE > 80th percentile
+    (expensive), defers 50% contribution to cash for later deployment. When PE
+    < 20th percentile (cheap), deploys accumulated cash on top of base contribution.
+
+    Budget-aware: total deployed never exceeds `total_budget`; final value
+    includes remaining cash. This ensures fair comparison with passive DCA.
+
+    Returns:
+        months, portfolio_paths, alloc_paths, cash_paths
+    """
+    months = pd.date_range(start=start_date, end=end_date, freq="ME")
+    n_steps = len(months)
+    if n_steps <= 0:
+        raise RuntimeError("Simulation horizon has zero monthly steps.")
+
+    rng = np.random.default_rng(RNG_SEED)
+    shocks = rng.standard_normal((n_steps, n_paths))
+
+    # OU PE percentile path: mean-reverts to 0.50, half-life ~24 months
+    theta = 0.50
+    kappa = np.log(2) / 24.0  # half-life of 24 months
+    sigma_ou = 0.08  # monthly noise
+    pe_paths = np.full(n_paths, theta, dtype=float)
+
+    portfolio_paths = np.zeros((n_steps, n_paths), dtype=float)
+    alloc_paths = np.zeros((n_steps, n_paths), dtype=float)
+    cash_paths = np.zeros((n_steps, n_paths), dtype=float)
+    portfolio = np.zeros(n_paths, dtype=float)
+    cash = np.zeros(n_paths, dtype=float)
+    invested_total = np.zeros(n_paths, dtype=float)
+
+    for t in range(n_steps):
+        if t < investment_months:
+            cash += monthly_contribution
+
+        # Update OU PE signal for this month (monthly step, dt = 1)
+        pe_paths = pe_paths + kappa * (theta - pe_paths) + sigma_ou * rng.standard_normal(n_paths)
+        pe_paths = np.clip(pe_paths, 0.01, 0.99)
+
+        alloc_mult = np.ones(n_paths, dtype=float)
+        cheap_mask = pe_paths < 0.20
+        expensive_mask = pe_paths > 0.80
+
+        base_invest = monthly_contribution if t < investment_months else 0.0
+
+        # Conservative (PE > 0.80): defer 50% — invest less, build cash
+        alloc_mult[expensive_mask] = 0.5
+
+        # Aggressive (PE < 0.20): deploy up to 2× base from accumulated cash
+        alloc_mult[cheap_mask] = np.minimum(
+            2.0,
+            1.0 + cash[cheap_mask] / np.maximum(base_invest, 1.0)
+        )
+
+        invest_amount = base_invest * alloc_mult
+        # Cannot invest more than available cash or remaining budget
+        invest_amount = np.minimum(invest_amount, cash)
+        remaining_budget = np.maximum(total_budget - invested_total, 0.0)
+        invest_amount = np.minimum(invest_amount, remaining_budget)
+
+        portfolio += invest_amount
+        cash -= invest_amount
+        invested_total += invest_amount
+        alloc_paths[t] = invest_amount
+        cash_paths[t] = cash
+
+        monthly_mu_log = (annual_mean_return - 0.5 * annual_volatility**2) / 12.0
+        monthly_sigma_log = annual_volatility / np.sqrt(12.0)
+        growth_factors = np.exp(monthly_mu_log + monthly_sigma_log * shocks[t])
+        portfolio *= growth_factors
+        portfolio_paths[t] = portfolio
+
+    return months, portfolio_paths, alloc_paths, cash_paths
+
+
 def run_historical_simulation(
     daily_returns: pd.Series,
     n_paths: int,
@@ -127,17 +277,36 @@ def run_historical_simulation(
     return months, portfolio_paths
 
 
+def compute_var_cvar(final_values: np.ndarray, total_investment: float) -> dict[str, float]:
+    """Compute VaR and CVaR (Expected Shortfall) from terminal values.
+
+    VaR: dollar loss at given confidence level. CVaR: expected loss beyond VaR.
+    Loss = total_investment - final_value (positive = loss).
+    """
+    losses = total_investment - final_values
+    result = {}
+    for level in VAR_LEVELS:
+        alpha = 1 - level
+        var = float(np.percentile(losses, level * 100))
+        cvar = float(losses[losses >= var].mean()) if np.any(losses >= var) else var
+        result[f"var_{int(level*100)}"] = var
+        result[f"cvar_{int(level*100)}"] = cvar
+    return result
+
+
 def compute_stats(
     final_values: np.ndarray, total_investment: float, label: str,
     annual_mean_return: float, annual_volatility: float,
 ) -> SimulationStats:
-    """Compute summary statistics from final portfolio values."""
+    """Compute summary statistics including VaR/CVaR from final portfolio values."""
     final_profit_loss = final_values - total_investment
     winning_probability = float(np.mean(final_values > total_investment))
     median_profit_loss = float(np.median(final_profit_loss))
 
     ci_low_value, ci_high_value = np.percentile(final_values, [2.5, 97.5])
     ci_low_pl, ci_high_pl = np.percentile(final_profit_loss, [2.5, 97.5])
+
+    var_cvar = compute_var_cvar(final_values, total_investment)
 
     return SimulationStats(
         label=label,
@@ -150,6 +319,10 @@ def compute_stats(
         ci_low_pl=float(ci_low_pl),
         ci_high_pl=float(ci_high_pl),
         total_investment=total_investment,
+        var_95=var_cvar["var_95"],
+        cvar_95=var_cvar["cvar_95"],
+        var_99=var_cvar["var_99"],
+        cvar_99=var_cvar["cvar_99"],
     )
 
 
@@ -160,8 +333,9 @@ def plot_results(
     title_suffix: str = "",
     output_name: str = "monte_carlo_csi_consumer.png",
     label: str = "",
+    var_stats: dict | None = None,
 ) -> Path:
-    """Plot fan chart and final P/L histogram."""
+    """Plot fan chart and final P/L histogram with VaR overlay."""
     fan_pct = np.percentile(portfolio_paths, [5, 25, 50, 75, 95], axis=1)
     final_pl = portfolio_paths[-1] - total_investment
 
@@ -183,10 +357,21 @@ def plot_results(
     ax1 = axes[1]
     ax1.hist(final_pl, bins=60, alpha=0.8, edgecolor="black")
     ax1.axvline(0.0, linestyle="--", linewidth=1.5, label="Break-even")
+
+    if var_stats:
+        var_95 = var_stats.get("var_95", np.nan)
+        var_99 = var_stats.get("var_99", np.nan)
+        if np.isfinite(var_95):
+            ax1.axvline(-var_95, linestyle="-.", linewidth=1.2, color="orange",
+                        label=f"VaR 95% ({var_95:,.0f} loss)")
+        if np.isfinite(var_99):
+            ax1.axvline(-var_99, linestyle=":", linewidth=1.2, color="red",
+                        label=f"VaR 99% ({var_99:,.0f} loss)")
+
     ax1.set_title(f"Distribution of Final Profit/Loss {title_suffix}")
     ax1.set_xlabel("Final Profit/Loss (CNY)")
     ax1.set_ylabel("Frequency")
-    ax1.legend(loc="upper right")
+    ax1.legend(loc="upper right", fontsize=8)
 
     fig.autofmt_xdate(rotation=45)
     plt.tight_layout()
@@ -202,7 +387,7 @@ def plot_dca_comparison(
     all_stats: list[SimulationStats],
     output_name: str = "monte_carlo_dca_comparison.png",
 ) -> Path:
-    """Plot bar chart comparing winning probability and median P/L across DCA scenarios."""
+    """Plot bar chart comparing winning probability and median P/L across scenarios."""
     labels = [s.label for s in all_stats]
     win_probs = [s.winning_probability for s in all_stats]
     med_pls = [s.median_profit_loss for s in all_stats]
@@ -233,6 +418,51 @@ def plot_dca_comparison(
     return output_path
 
 
+def plot_var_backtest(
+    all_stats: list[SimulationStats],
+    historical_worst_drawdown_pct: float,
+    output_name: str = "monte_carlo_var_backtest.png",
+) -> Path:
+    """Plot VaR/CVaR bar chart across scenarios, benchmarked against historical worst drawdown."""
+    labels = [s.label for s in all_stats]
+    var_95s = np.array([s.var_95 for s in all_stats], dtype=float)
+    cvar_95s = np.array([s.cvar_95 for s in all_stats], dtype=float)
+    var_99s = np.array([s.var_99 for s in all_stats], dtype=float)
+    cvar_99s = np.array([s.cvar_99 for s in all_stats], dtype=float)
+
+    mask = np.isfinite(var_95s)
+    labels = [l for l, m in zip(labels, mask) if m]
+    var_95s = var_95s[mask]
+    cvar_95s = cvar_95s[mask]
+    var_99s = var_99s[mask]
+    cvar_99s = cvar_99s[mask]
+
+    x = np.arange(len(labels))
+    width = 0.2
+
+    plt.style.use("seaborn-v0_8-whitegrid")
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    ax.bar(x - 1.5 * width, var_95s, width, label="VaR 95%", alpha=0.85, color="#ff7f0e")
+    ax.bar(x - 0.5 * width, cvar_95s, width, label="CVaR 95%", alpha=0.85, color="#1f77b4")
+    ax.bar(x + 0.5 * width, var_99s, width, label="VaR 99%", alpha=0.85, color="#d62728")
+    ax.bar(x + 1.5 * width, cvar_99s, width, label="CVaR 99%", alpha=0.85, color="#9467bd")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("Loss at Risk (CNY)")
+    ax.set_title(f"VaR / CVaR Backtest — Historical Worst Drawdown: {historical_worst_drawdown_pct:.1%}")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.25, axis="y")
+
+    fig.tight_layout()
+    output_path = Path(__file__).resolve().parent / output_name
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
+    print(f"VaR backtest chart saved to: {output_path}")
+    plt.show()
+    return output_path
+
+
 def print_summary(stats: SimulationStats) -> None:
     """Print simulation statistics."""
     print(f"\n{stats.label}")
@@ -244,6 +474,10 @@ def print_summary(stats: SimulationStats) -> None:
     print(f"Median Profit/Loss (CNY)    : {stats.median_profit_loss:,.2f}")
     print(f"95% CI Final Value (CNY)    : [{stats.ci_low_value:,.2f}, {stats.ci_high_value:,.2f}]")
     print(f"95% CI Profit/Loss (CNY)    : [{stats.ci_low_pl:,.2f}, {stats.ci_high_pl:,.2f}]")
+    print(f"VaR 95% (CNY)               : {stats.var_95:,.2f}")
+    print(f"CVaR 95% (CNY)              : {stats.cvar_95:,.2f}")
+    print(f"VaR 99% (CNY)               : {stats.var_99:,.2f}")
+    print(f"CVaR 99% (CNY)              : {stats.cvar_99:,.2f}")
     print("-" * 70)
 
 
@@ -252,7 +486,12 @@ def main() -> None:
     prices = raw.set_index("date")["close"].rename(CSI_CONSUMER_SYMBOL)
     annual_mean_return, annual_volatility = estimate_annual_params(prices)
 
-    # ── 1) Constant-vol GBM (original baseline) ─────────────────────────────
+    # Historical worst drawdown for VaR backtest benchmark
+    cummax = prices.cummax()
+    drawdowns = prices / cummax - 1.0
+    historical_worst_dd = float(drawdowns.min())
+
+    # ── 1) Constant-vol GBM (baseline) ────────────────────────────────────
     dca_months_options = [10, 60, 120]
     all_stats: list[SimulationStats] = []
 
@@ -262,11 +501,8 @@ def main() -> None:
         months, paths = run_monte_carlo(
             annual_mean_return=annual_mean_return,
             annual_volatility=annual_volatility,
-            n_paths=SIM_PATHS,
-            start_date=SIM_START,
-            end_date=SIM_END,
-            monthly_investment=MONTHLY_INVESTMENT,
-            investment_months=inv_months,
+            n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
+            monthly_investment=MONTHLY_INVESTMENT, investment_months=inv_months,
         )
         stats = compute_stats(paths[-1], total_inv, label,
                               annual_mean_return, annual_volatility)
@@ -275,36 +511,32 @@ def main() -> None:
         if inv_months == 10:
             plot_results(months, paths, total_inv,
                          title_suffix="(Constant Vol, 10mo DCA)",
-                         output_name="monte_carlo_csi_consumer.png",
-                         label=label)
+                         output_name="monte_carlo_csi_consumer.png", label=label,
+                         var_stats={"var_95": stats.var_95, "var_99": stats.var_99})
 
-    # ── 2) Lump-sum comparison (60-month investment upfront) ───────────────
+    # ── 2) Lump-sum comparison ───────────────────────────────────────────
     lump_months = 60
     total_lump = MONTHLY_INVESTMENT * lump_months
     label_lump = f"Lump-sum {lump_months}mo upfront (const vol)"
     months_lump, paths_lump = run_monte_carlo(
         annual_mean_return=annual_mean_return,
         annual_volatility=annual_volatility,
-        n_paths=SIM_PATHS,
-        start_date=SIM_START,
-        end_date=SIM_END,
-        monthly_investment=total_lump,
-        investment_months=1,
+        n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
+        monthly_investment=total_lump, investment_months=1,
     )
     stats_lump = compute_stats(paths_lump[-1], total_lump, label_lump,
                                annual_mean_return, annual_volatility)
     print_summary(stats_lump)
     all_stats.append(stats_lump)
 
-    # ── 3) GARCH time-varying vol GBM ──────────────────────────────────────
+    # ── 3) GARCH time-varying vol GBM ────────────────────────────────────
+    monthly_vol_array_garch = None
     try:
         cond_vol, fc_vol_daily, forecast_start = garch_fit_and_forecast(
             prices, forecast_horizon=2520
         )
-
         months_ref = pd.date_range(start=SIM_START, end=SIM_END, freq="ME")
-        # GARCH returns vol in % (returns scaled ×100 for fitting); MC expects decimal
-        monthly_vol_array = daily_vol_to_monthly(fc_vol_daily, months_ref, forecast_start) / 100.0
+        monthly_vol_array_garch = daily_vol_to_monthly(fc_vol_daily, months_ref, forecast_start) / 100.0
 
         for inv_months in dca_months_options:
             total_inv = MONTHLY_INVESTMENT * inv_months
@@ -312,43 +544,52 @@ def main() -> None:
             months_g, paths_g = run_monte_carlo(
                 annual_mean_return=annual_mean_return,
                 annual_volatility=annual_volatility,
-                n_paths=SIM_PATHS,
-                start_date=SIM_START,
-                end_date=SIM_END,
-                monthly_investment=MONTHLY_INVESTMENT,
-                investment_months=inv_months,
-                annual_vol_array=monthly_vol_array,
+                n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
+                monthly_investment=MONTHLY_INVESTMENT, investment_months=inv_months,
+                annual_vol_array=monthly_vol_array_garch,
             )
             stats_g = compute_stats(paths_g[-1], total_inv, label_garch,
                                     annual_mean_return, annual_volatility)
             print_summary(stats_g)
             all_stats.append(stats_g)
-            if inv_months == 10:
-                plot_results(months_g, paths_g, total_inv,
-                             title_suffix="(GARCH Time-Varying Vol, 10mo DCA)",
-                             output_name="monte_carlo_garch_vol.png",
-                             label=label_garch)
 
         # Lump-sum with GARCH vol
-        label_garch_lump = f"Lump-sum {lump_months}mo upfront (GARCH vol)"
+        label_gl = f"Lump-sum {lump_months}mo upfront (GARCH vol)"
         months_gl, paths_gl = run_monte_carlo(
             annual_mean_return=annual_mean_return,
             annual_volatility=annual_volatility,
-            n_paths=SIM_PATHS,
-            start_date=SIM_START,
-            end_date=SIM_END,
-            monthly_investment=total_lump,
-            investment_months=1,
-            annual_vol_array=monthly_vol_array,
+            n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
+            monthly_investment=total_lump, investment_months=1,
+            annual_vol_array=monthly_vol_array_garch,
         )
-        stats_gl = compute_stats(paths_gl[-1], total_lump, label_garch_lump,
+        stats_gl = compute_stats(paths_gl[-1], total_lump, label_gl,
                                  annual_mean_return, annual_volatility)
         print_summary(stats_gl)
         all_stats.append(stats_gl)
+
+        # ── 3b) Regime-switching MC (two-state) ──────────────────────────
+        low_vol = float(np.percentile(monthly_vol_array_garch, 30))
+        high_vol = float(np.percentile(monthly_vol_array_garch, 70))
+        trans = np.array([[0.85, 0.15], [0.15, 0.85]])  # 85% stay in same regime
+        regime_vols = {0: low_vol, 1: high_vol}
+
+        label_rs = "DCA 60mo (Regime-Switching)"
+        total_inv = MONTHLY_INVESTMENT * 60
+        months_rs, paths_rs, regimes_rs = run_regime_switching_mc(
+            annual_mean_return=annual_mean_return,
+            annual_volatility=annual_volatility,
+            n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
+            monthly_investment=MONTHLY_INVESTMENT, investment_months=60,
+            regime_vols=regime_vols, transition_matrix=trans, initial_regime=0,
+        )
+        stats_rs = compute_stats(paths_rs[-1], total_inv, label_rs,
+                                 annual_mean_return, annual_volatility)
+        print_summary(stats_rs)
+        all_stats.append(stats_rs)
     except Exception as e:
         print(f"[GARCH-MC linkage skipped: {e}]")
 
-    # ── 4) Historical simulation benchmark ─────────────────────────────────
+    # ── 4) Historical simulation benchmark ───────────────────────────────
     daily_returns = prices.pct_change().dropna()
     daily_returns = daily_returns[daily_returns.index < pd.Timestamp(SIM_START)]
     for inv_months in dca_months_options:
@@ -356,28 +597,40 @@ def main() -> None:
         label_hs = f"DCA {inv_months}mo (Hist Sim)"
         try:
             months_hs, paths_hs = run_historical_simulation(
-                daily_returns=daily_returns,
-                n_paths=SIM_PATHS,
-                start_date=SIM_START,
-                end_date=SIM_END,
-                monthly_investment=MONTHLY_INVESTMENT,
-                investment_months=inv_months,
+                daily_returns=daily_returns, n_paths=SIM_PATHS,
+                start_date=SIM_START, end_date=SIM_END,
+                monthly_investment=MONTHLY_INVESTMENT, investment_months=inv_months,
             )
             stats_hs = compute_stats(paths_hs[-1], total_inv, label_hs,
                                      annual_mean_return, annual_volatility)
             print_summary(stats_hs)
             all_stats.append(stats_hs)
-            if inv_months == 10:
-                plot_results(months_hs, paths_hs, total_inv,
-                             title_suffix="(Historical Simulation, 10mo DCA)",
-                             output_name="monte_carlo_hist_sim.png",
-                             label=label_hs)
         except Exception as e:
             print(f"[Historical simulation skipped for {inv_months}mo: {e}]")
 
-    # ── 5) DCA scenario comparison chart ───────────────────────────────────
+    # ── 5) Strategy MC (valuation-driven allocation, OU PE signal) ──────────
+    label_strat = "DCA 60mo (OU PE Active)"
+    total_inv = MONTHLY_INVESTMENT * 60
+    try:
+        months_st, paths_st, alloc_st, cash_st = run_strategy_mc(
+            annual_mean_return=annual_mean_return,
+            annual_volatility=annual_volatility,
+            n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
+            monthly_contribution=MONTHLY_INVESTMENT, investment_months=60,
+            total_budget=total_inv,
+        )
+        final_with_cash = paths_st[-1] + cash_st[-1]
+        stats_st = compute_stats(final_with_cash, total_inv, label_strat,
+                                 annual_mean_return, annual_volatility)
+        print_summary(stats_st)
+        all_stats.append(stats_st)
+    except Exception as e:
+        print(f"[Strategy MC skipped: {e}]")
+
+    # ── 6) Comparison & VaR backtest charts ───────────────────────────────
     if len(all_stats) > 1:
         plot_dca_comparison(all_stats)
+        plot_var_backtest(all_stats, historical_worst_dd)
 
 
 if __name__ == "__main__":

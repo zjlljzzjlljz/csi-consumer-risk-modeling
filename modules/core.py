@@ -255,3 +255,84 @@ def daily_vol_to_monthly(
             monthly_vol[i] = np.nanmean(daily_vol_annual) if n_days > 0 else 0.0
 
     return monthly_vol
+
+
+def fit_asymmetric_vol_models(
+    returns_pct: pd.Series, forecast_horizon: int = 252
+) -> dict[str, dict]:
+    """Fit GARCH(1,1), EGARCH(1,1), and GJR-GARCH(1,1); return results with BIC ranking.
+
+    Returns dict keyed by model name, each containing:
+        'cond_vol' — conditional volatility series (annualized %)
+        'forecast_vol' — forecasted vol array (annualized %)
+        'forecast_start' — first forecast date
+        'params' — fitted params dict
+        'aic', 'bic' — information criteria
+        'converged' — bool
+    """
+    from arch import arch_model
+
+    pct_returns = returns_pct.dropna()
+    if len(pct_returns) < 100:
+        raise ValueError(f"Not enough data: {len(pct_returns)} points.")
+
+    models = {
+        "GARCH(1,1)": {"vol": "Garch", "kwargs": {}},
+        "EGARCH(1,1)": {"vol": "EGARCH", "kwargs": {}},
+        "GJR-GARCH(1,1)": {"vol": "Garch", "kwargs": {"o": 1}},
+    }
+
+    results = {}
+
+    for name, spec in models.items():
+        try:
+            am = arch_model(
+                pct_returns,
+                vol=spec["vol"], p=1, q=1,
+                mean="Constant", dist="Normal", rescale=False,
+                **spec["kwargs"],
+            )
+            res = am.fit(disp="off")
+            cond_vol = res.conditional_volatility * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+            fc = res.forecast(horizon=forecast_horizon)
+            var_next = fc.variance.iloc[-1].to_numpy()
+            vol_next = np.sqrt(var_next) * np.sqrt(TRADING_DAYS_PER_YEAR)
+
+            forecast_start = pct_returns.index[-1] + pd.Timedelta(days=1)
+
+            results[name] = {
+                "cond_vol": cond_vol,
+                "forecast_vol": vol_next,
+                "forecast_start": forecast_start,
+                "aic": float(res.aic),
+                "bic": float(res.bic),
+                "converged": True,
+                "params": {k: v for k, v in res.params.items()},
+            }
+        except Exception as e:
+            results[name] = {
+                "cond_vol": None, "forecast_vol": None,
+                "forecast_start": None,
+                "aic": np.inf, "bic": np.inf,
+                "converged": False,
+                "params": {},
+                "error": str(e)[:200],
+            }
+
+    return results
+
+
+def garch_regime_labels(
+    cond_vol: pd.Series, high_vol_pct: float = 70.0
+) -> pd.Series:
+    """Label each day as 0 (low-vol) or 1 (high-vol) based on conditional vol percentile.
+
+    Args:
+        cond_vol: annualized conditional volatility series
+        high_vol_pct: percentile threshold above which regime is "high vol"
+    Returns:
+        Boolean Series (True = high vol regime)
+    """
+    threshold = np.percentile(cond_vol.dropna(), high_vol_pct)
+    return cond_vol >= threshold
