@@ -12,6 +12,7 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import t as t_dist
 
 from modules.core import (
     CSI_CONSUMER_SYMBOL,
@@ -70,7 +71,7 @@ def run_monte_carlo(
     If `annual_vol_array` is provided (shape: n_steps,), each month uses its own
     annualized volatility. Otherwise uses constant `annual_volatility`.
     """
-    months = pd.date_range(start=start_date, end=end_date, freq="ME")
+    months = pd.date_range(start=start_date, end=end_date, freq="M")
     n_steps = len(months)
     if n_steps <= 0:
         raise RuntimeError("Simulation horizon has zero monthly steps.")
@@ -80,7 +81,7 @@ def run_monte_carlo(
                                   mode="edge")
 
     rng = np.random.default_rng(RNG_SEED)
-    shocks = rng.standard_normal((n_steps, n_paths))
+    shocks = t_dist.rvs(df=5, size=(n_steps, n_paths), random_state=RNG_SEED)
 
     portfolio_paths = np.zeros((n_steps, n_paths), dtype=float)
     portfolio = np.zeros(n_paths, dtype=float)
@@ -110,6 +111,7 @@ def run_regime_switching_mc(
     regime_vols: dict[int, float],
     transition_matrix: np.ndarray,
     initial_regime: int = 0,
+    regime_means: dict[int, float] | None = None,
 ) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
     """Simulate portfolio paths with two-regime Markov-switching GBM.
 
@@ -117,16 +119,17 @@ def run_regime_switching_mc(
         regime_vols: {0: low_vol, 1: high_vol} — annualized vol for each regime
         transition_matrix: 2×2 Markov transition matrix P[i,j] = P(state j | state i)
         initial_regime: starting regime (0 or 1)
+        regime_means: optional annualized mean return for each regime
     Returns:
         months, portfolio_paths, regime_paths (n_steps × n_paths of regime labels)
     """
-    months = pd.date_range(start=start_date, end=end_date, freq="ME")
+    months = pd.date_range(start=start_date, end=end_date, freq="M")
     n_steps = len(months)
     if n_steps <= 0:
         raise RuntimeError("Simulation horizon has zero monthly steps.")
 
     rng = np.random.default_rng(RNG_SEED)
-    shocks = rng.standard_normal((n_steps, n_paths))
+    shocks = t_dist.rvs(df=5, size=(n_steps, n_paths), random_state=RNG_SEED)
     regime_draws = rng.uniform(0, 1, (n_steps, n_paths))
 
     portfolio_paths = np.zeros((n_steps, n_paths), dtype=float)
@@ -139,7 +142,12 @@ def run_regime_switching_mc(
             portfolio += monthly_investment
 
         vol_path = np.array([regime_vols[r] for r in current_regime], dtype=float)
-        monthly_mu_log = (annual_mean_return - 0.5 * vol_path**2) / 12.0
+        if regime_means is not None:
+            mu_path = np.array([regime_means[r] for r in current_regime], dtype=float)
+        else:
+            mu_path = np.full(n_paths, annual_mean_return, dtype=float)
+
+        monthly_mu_log = (mu_path - 0.5 * vol_path**2) / 12.0
         monthly_sigma_log = vol_path / np.sqrt(12.0)
         growth_factors = np.exp(monthly_mu_log + monthly_sigma_log * shocks[t])
         portfolio *= growth_factors
@@ -177,18 +185,20 @@ def run_strategy_mc(
     Returns:
         months, portfolio_paths, alloc_paths, cash_paths
     """
-    months = pd.date_range(start=start_date, end=end_date, freq="ME")
+    months = pd.date_range(start=start_date, end=end_date, freq="M")
     n_steps = len(months)
     if n_steps <= 0:
         raise RuntimeError("Simulation horizon has zero monthly steps.")
 
     rng = np.random.default_rng(RNG_SEED)
-    shocks = rng.standard_normal((n_steps, n_paths))
+    shocks = t_dist.rvs(df=5, size=(n_steps, n_paths), random_state=RNG_SEED)
 
     # OU PE percentile path: mean-reverts to 0.50, half-life ~24 months
     theta = 0.50
     kappa = np.log(2) / 24.0  # half-life of 24 months
     sigma_ou = 0.08  # monthly noise
+    ou_corr = -0.3  # PE-price shock correlation
+    pe_noise_coef = np.sqrt(max(1 - ou_corr**2, 0.01))
     pe_paths = np.full(n_paths, theta, dtype=float)
 
     portfolio_paths = np.zeros((n_steps, n_paths), dtype=float)
@@ -202,8 +212,10 @@ def run_strategy_mc(
         if t < investment_months:
             cash += monthly_contribution
 
-        # Update OU PE signal for this month (monthly step, dt = 1)
-        pe_paths = pe_paths + kappa * (theta - pe_paths) + sigma_ou * rng.standard_normal(n_paths)
+        # Link the OU signal to the same shock driving this month's price move.
+        indep_noise = rng.standard_normal(n_paths)
+        pe_noise = ou_corr * shocks[t] + pe_noise_coef * indep_noise
+        pe_paths = pe_paths + kappa * (theta - pe_paths) + sigma_ou * pe_noise
         pe_paths = np.clip(pe_paths, 0.01, 0.99)
 
         alloc_mult = np.ones(n_paths, dtype=float)
@@ -251,7 +263,7 @@ def run_historical_simulation(
     investment_months: int,
 ) -> tuple[pd.DatetimeIndex, np.ndarray]:
     """Bootstrapped historical simulation: sample daily returns with replacement."""
-    months = pd.date_range(start=start_date, end=end_date, freq="ME")
+    months = pd.date_range(start=start_date, end=end_date, freq="M")
     n_steps = len(months)
     if n_steps <= 0:
         raise RuntimeError("Simulation horizon has zero monthly steps.")
@@ -292,6 +304,45 @@ def compute_var_cvar(final_values: np.ndarray, total_investment: float) -> dict[
         result[f"var_{int(level*100)}"] = var
         result[f"cvar_{int(level*100)}"] = cvar
     return result
+
+
+def kupiec_test(
+    losses: np.ndarray, var_level: float, confidence: float = 0.95
+) -> dict[str, float]:
+    """Run the Kupiec proportion-of-failures test for a VaR model."""
+    from scipy.stats import chi2
+
+    del confidence  # The POF statistic itself is independent of the decision cutoff.
+    n_total = len(losses)
+    if n_total == 0:
+        raise ValueError("Kupiec test requires at least one loss observation.")
+
+    var_value = float(np.percentile(losses, var_level * 100))
+    n_exceed = int((losses > var_value).sum())
+
+    expected_rate = 1 - var_level
+    actual_rate = n_exceed / n_total
+
+    if n_exceed == 0:
+        lr_stat = -2 * n_total * np.log(1 - expected_rate)
+    elif n_exceed == n_total:
+        lr_stat = -2 * n_total * np.log(expected_rate)
+    else:
+        lr_stat = -2 * (
+            (n_total - n_exceed)
+            * np.log((1 - expected_rate) / (1 - actual_rate))
+            + n_exceed * np.log(expected_rate / actual_rate)
+        )
+
+    p_value = 1 - chi2.cdf(lr_stat, df=1)
+
+    return {
+        "n_total": n_total,
+        "n_exceed": n_exceed,
+        "expected_rate": expected_rate,
+        "actual_rate": actual_rate,
+        "p_value": float(p_value),
+    }
 
 
 def compute_stats(
@@ -481,6 +532,62 @@ def print_summary(stats: SimulationStats) -> None:
     print("-" * 70)
 
 
+def estimate_regime_transition_matrix(
+    cond_vol: pd.Series, high_vol_pct: float = 70.0
+) -> np.ndarray:
+    """Estimate a two-state Markov transition matrix from conditional volatility."""
+    threshold = np.percentile(cond_vol.dropna(), high_vol_pct)
+    regimes = (cond_vol >= threshold).astype(int).dropna()
+
+    if len(regimes) < 100:
+        return np.array([[0.85, 0.15], [0.15, 0.85]])
+
+    trans_counts = np.zeros((2, 2), dtype=int)
+    regime_prev = regimes.iloc[:-1].values
+    regime_curr = regimes.iloc[1:].values
+
+    for i in range(len(regime_prev)):
+        trans_counts[regime_prev[i], regime_curr[i]] += 1
+
+    trans_matrix = np.zeros((2, 2), dtype=float)
+    for i in range(2):
+        row_sum = trans_counts[i].sum()
+        if row_sum > 0:
+            trans_matrix[i] = trans_counts[i] / row_sum
+        else:
+            trans_matrix[i] = (
+                np.array([0.85, 0.15]) if i == 0 else np.array([0.15, 0.85])
+            )
+
+    return trans_matrix
+
+
+def estimate_regime_returns(
+    daily_returns: pd.Series, cond_vol: pd.Series, high_vol_pct: float = 70.0
+) -> dict[int, float]:
+    """Estimate annualized mean return for low- and high-volatility regimes."""
+    threshold = np.percentile(cond_vol.dropna(), high_vol_pct)
+    regimes = (cond_vol >= threshold).astype(int)
+
+    common_index = regimes.index.intersection(daily_returns.index)
+    aligned_ret = daily_returns.loc[common_index]
+    aligned_reg = regimes.loc[common_index]
+
+    regime_means = {}
+    for state in [0, 1]:
+        mask = aligned_reg == state
+        if mask.sum() > 1:
+            regime_means[state] = float(
+                aligned_ret[mask].mean() * TRADING_DAYS_PER_YEAR
+            )
+        else:
+            regime_means[state] = float(
+                daily_returns.mean() * TRADING_DAYS_PER_YEAR
+            )
+
+    return regime_means
+
+
 def main() -> None:
     raw = fetch_index_daily(CSI_CONSUMER_SYMBOL, HISTORY_START)
     prices = raw.set_index("date")["close"].rename(CSI_CONSUMER_SYMBOL)
@@ -535,7 +642,7 @@ def main() -> None:
         cond_vol, fc_vol_daily, forecast_start = garch_fit_and_forecast(
             prices, forecast_horizon=2520
         )
-        months_ref = pd.date_range(start=SIM_START, end=SIM_END, freq="ME")
+        months_ref = pd.date_range(start=SIM_START, end=SIM_END, freq="M")
         monthly_vol_array_garch = daily_vol_to_monthly(fc_vol_daily, months_ref, forecast_start) / 100.0
 
         for inv_months in dca_months_options:
@@ -567,13 +674,38 @@ def main() -> None:
         print_summary(stats_gl)
         all_stats.append(stats_gl)
 
-        # ── 3b) Regime-switching MC (two-state) ──────────────────────────
-        low_vol = float(np.percentile(monthly_vol_array_garch, 30))
-        high_vol = float(np.percentile(monthly_vol_array_garch, 70))
-        trans = np.array([[0.85, 0.15], [0.15, 0.85]])  # 85% stay in same regime
+        # ── 3b) Regime-switching MC (two-state, data-driven) ─────────────
+        cond_vol_hist = cond_vol / 100.0
+        trans = estimate_regime_transition_matrix(cond_vol_hist)
+        daily_ret = prices.pct_change().dropna()
+        regime_return_estimates = estimate_regime_returns(daily_ret, cond_vol_hist)
+
+        vol_threshold = np.percentile(cond_vol_hist.dropna(), 70)
+        low_vol_mask = cond_vol_hist < vol_threshold
+        high_vol_mask = cond_vol_hist >= vol_threshold
+        low_vol = (
+            float(cond_vol_hist[low_vol_mask].mean())
+            if low_vol_mask.any()
+            else float(cond_vol_hist.mean()) * 0.7
+        )
+        high_vol = (
+            float(cond_vol_hist[high_vol_mask].mean())
+            if high_vol_mask.any()
+            else float(cond_vol_hist.mean()) * 1.3
+        )
         regime_vols = {0: low_vol, 1: high_vol}
 
-        label_rs = "DCA 60mo (Regime-Switching)"
+        print(f"\n[Regime-Switching] Estimated transition matrix:\n{trans}")
+        print(
+            f"  Low-vol ({low_vol:.1%}): mean ret = "
+            f"{regime_return_estimates.get(0, annual_mean_return):.2%}"
+        )
+        print(
+            f"  High-vol ({high_vol:.1%}): mean ret = "
+            f"{regime_return_estimates.get(1, annual_mean_return):.2%}"
+        )
+
+        label_rs = "DCA 60mo (Regime-Switching, data-driven)"
         total_inv = MONTHLY_INVESTMENT * 60
         months_rs, paths_rs, regimes_rs = run_regime_switching_mc(
             annual_mean_return=annual_mean_return,
@@ -581,6 +713,7 @@ def main() -> None:
             n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
             monthly_investment=MONTHLY_INVESTMENT, investment_months=60,
             regime_vols=regime_vols, transition_matrix=trans, initial_regime=0,
+            regime_means=regime_return_estimates,
         )
         stats_rs = compute_stats(paths_rs[-1], total_inv, label_rs,
                                  annual_mean_return, annual_volatility)
@@ -631,6 +764,27 @@ def main() -> None:
     if len(all_stats) > 1:
         plot_dca_comparison(all_stats)
         plot_var_backtest(all_stats, historical_worst_dd)
+
+    # ── 7) Kupiec VaR backtest ──────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("Kupiec POF VaR Backtest (Constant Vol, 10mo DCA)")
+    print("=" * 70)
+    months_ref, paths_ref = run_monte_carlo(
+        annual_mean_return=annual_mean_return,
+        annual_volatility=annual_volatility,
+        n_paths=SIM_PATHS, start_date=SIM_START, end_date=SIM_END,
+        monthly_investment=MONTHLY_INVESTMENT, investment_months=10,
+    )
+    total_ref = MONTHLY_INVESTMENT * 10
+    losses_ref = total_ref - paths_ref[-1]
+    for level in [0.95, 0.99]:
+        kp = kupiec_test(losses_ref, level)
+        verdict = "(PASS)" if kp["p_value"] > 0.05 else "(FAIL)"
+        print(
+            f"  VaR {level*100:.0f}%: expected exceed={kp['expected_rate']:.1%}, "
+            f"actual={kp['actual_rate']:.1%} ({kp['n_exceed']}/{kp['n_total']}), "
+            f"p-value={kp['p_value']:.4f} {verdict}"
+        )
 
 
 if __name__ == "__main__":

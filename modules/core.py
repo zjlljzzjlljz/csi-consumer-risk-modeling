@@ -190,7 +190,7 @@ def garch_fit_and_forecast(
     if len(returns_pct) < 100:
         raise ValueError(f"Not enough data for GARCH fitting: {len(returns_pct)} points.")
 
-    am = arch_model(returns_pct, vol="Garch", p=1, q=1, mean="Constant", dist="Normal", rescale=False)
+    am = arch_model(returns_pct, vol="Garch", p=1, q=1, mean="Constant", dist="t", rescale=False)
     res = am.fit(disp="off")
 
     cond_vol_annual = res.conditional_volatility * np.sqrt(TRADING_DAYS_PER_YEAR)
@@ -289,7 +289,7 @@ def fit_asymmetric_vol_models(
             am = arch_model(
                 pct_returns,
                 vol=spec["vol"], p=1, q=1,
-                mean="Constant", dist="Normal", rescale=False,
+                mean="Constant", dist="t", rescale=False,
                 **spec["kwargs"],
             )
             res = am.fit(disp="off")

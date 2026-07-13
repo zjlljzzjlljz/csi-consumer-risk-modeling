@@ -35,7 +35,7 @@ def main() -> int:
     from arch import arch_model
 
     am = arch_model(
-        returns_pct, vol="Garch", p=1, q=1, mean="Constant", dist="Normal", rescale=False,
+        returns_pct, vol="Garch", p=1, q=1, mean="Constant", dist="t", rescale=False,
     )
     res = am.fit(disp="off")
 

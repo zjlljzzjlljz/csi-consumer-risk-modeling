@@ -33,7 +33,7 @@ def rolling_garch_estimate(
         subset = returns_pct.iloc[start : start + window]
         end_date = subset.index[-1]
         try:
-            am = arch_model(subset, vol="Garch", p=1, q=1, mean="Constant", dist="Normal", rescale=False)
+            am = arch_model(subset, vol="Garch", p=1, q=1, mean="Constant", dist="t", rescale=False)
             res = am.fit(disp="off")
             rows.append({
                 "end_date": end_date,

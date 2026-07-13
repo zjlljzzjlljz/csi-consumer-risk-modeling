@@ -32,7 +32,7 @@ def fit_garch_grid(returns_pct: pd.Series, p_values: list[int], q_values: list[i
     for p in p_values:
         for q in q_values:
             try:
-                am_kwargs = dict(vol="Garch", p=p, q=q, mean="Constant", dist="Normal")
+                am_kwargs = dict(vol="Garch", p=p, q=q, mean="Constant", dist="t")
                 if "rescale" in arch_model_sig.parameters:
                     am_kwargs["rescale"] = False
 

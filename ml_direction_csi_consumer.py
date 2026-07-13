@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 import time
 
@@ -24,7 +25,7 @@ FEATURE_COLS = ["lag_ret_1", "lag_ret_3", "lag_ret_5", "lag_ret_10", "vol_5d", "
 def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
     """Resilient valuation pipeline that bypasses FundDB/Legulegu failures."""
 
-    def _normalize_pe(df: pd.DataFrame) -> pd.DataFrame:
+    def _normalize_pe(df: pd.DataFrame, tier_label: int) -> pd.DataFrame:
         if df.empty:
             return pd.DataFrame()
         temp = df.copy()
@@ -45,12 +46,28 @@ def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
         temp["pe_ttm"] = pd.to_numeric(temp[pe_col], errors="coerce")
         temp = temp.dropna(subset=["date", "pe_ttm"])[["date", "pe_ttm"]].sort_values("date")
         temp = temp[temp["date"] >= pd.Timestamp(start_date)]
+        temp["source_tier"] = tier_label
         return temp
+
+    # 0) Best: CSI index official PE/TTM from csindex.
+    # Wrapped in ThreadPoolExecutor with 15s timeout because AkShare's internal
+    # pd.read_excel(url) has no socket timeout and can hang indefinitely.
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(ak.stock_zh_index_value_csindex, symbol="399932")
+            df_csi = future.result(timeout=15)
+        time.sleep(1)
+        df_csi = _normalize_pe(df_csi, tier_label=0)
+        if not df_csi.empty:
+            print("Source: CSI Consumer Index PE via csindex (OFFICIAL)")
+            return df_csi
+    except (Exception, FuturesTimeoutError):
+        time.sleep(1)
 
     # 1) Preferred: stock_a_lg_indicator for Moutai PE (multiple symbol formats).
     for sym in ["600519", "sh600519", "600519.SH"]:
         try:
-            pe_df = _normalize_pe(ak.stock_a_lg_indicator(symbol=sym))
+            pe_df = _normalize_pe(ak.stock_a_lg_indicator(symbol=sym), tier_label=1)
             time.sleep(1)
             if not pe_df.empty:
                 print("Source: Moutai PE via stock_a_lg_indicator")
@@ -78,6 +95,7 @@ def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
             discount_factor = 0.95
             daily["pe_ttm"] = daily["close"] / (ma * discount_factor)
             pe_df = daily.dropna(subset=["pe_ttm"])[["date", "pe_ttm"]]
+            pe_df["source_tier"] = 2
             if not pe_df.empty:
                 print("Source: Moutai trend PE via stock_zh_a_daily")
                 print("Successfully bypassed 404 using [stock_zh_a_daily trend proxy]")
@@ -99,6 +117,7 @@ def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
                 # Dividend cadence as a weak valuation-like signal when PE endpoints are unavailable.
                 div["pe_ttm"] = 1.0 + np.arange(len(div), dtype=float) / max(len(div), 1)
                 pe_df = div[["date", "pe_ttm"]]
+                pe_df["source_tier"] = 3
                 print("Source: Fallback via stock_history_dividend")
                 print("Successfully bypassed 404 using [stock_history_dividend proxy]")
                 return pe_df
@@ -116,6 +135,7 @@ def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
             dg["pe_ttm"] = pd.to_numeric(dg[pe_col], errors="coerce")
             dg = dg.dropna(subset=["date", "pe_ttm"])[["date", "pe_ttm"]].sort_values("date")
             dg = dg[dg["date"] >= pd.Timestamp(start_date)]
+            dg["source_tier"] = 4
             if not dg.empty:
                 print("Source: Fallback via stock_a_pe_dg")
                 print("Successfully bypassed 404 using [stock_a_pe_dg]")
@@ -123,17 +143,11 @@ def fetch_consumer_pe_series(start_date: str) -> pd.DataFrame:
     except Exception:
         time.sleep(1)
 
-    # 4) Final manual proxy from CSI Consumer index price itself.
-    idx = fetch_index_daily(CSI_CONSUMER_SYMBOL, start_date)
-    ma_idx = idx["close"].rolling(120, min_periods=20).mean()
-    discount_factor = 0.97
-    idx["pe_ttm"] = idx["close"] / (ma_idx * discount_factor)
-    idx = idx.dropna(subset=["pe_ttm"])[["date", "pe_ttm"]]
-    if idx.empty:
-        raise RuntimeError("All valuation routes failed, including manual trend-based proxy.")
-    print("Source: Trend-based Proxy PE")
-    print("Successfully bypassed 404 using [Trend-based Proxy PE]")
-    return idx
+    raise RuntimeError(
+        "All PE data sources failed. "
+        "CSI Consumer Index PE requires Wind/CSCI official endpoint in production. "
+        "Current pipeline is a valuation-proxy fallback chain, not a true PE series."
+    )
 
 
 def build_features(df: pd.DataFrame, pe_df: pd.DataFrame) -> pd.DataFrame:
