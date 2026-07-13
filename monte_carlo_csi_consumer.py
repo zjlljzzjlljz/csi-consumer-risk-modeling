@@ -36,6 +36,7 @@ TOTAL_INVESTMENT = MONTHLY_INVESTMENT * INVESTMENT_MONTHS
 
 RNG_SEED = 42
 VAR_LEVELS = [0.95, 0.99]
+GARCH_CALIBRATION_WINDOW = 1008  # latest ~4 trading years, matching rolling analysis
 
 
 @dataclass
@@ -640,7 +641,13 @@ def main() -> None:
     monthly_vol_array_garch = None
     try:
         cond_vol, fc_vol_daily, forecast_start = garch_fit_and_forecast(
-            prices, forecast_horizon=2520
+            prices,
+            forecast_horizon=2520,
+            calibration_window=GARCH_CALIBRATION_WINDOW,
+        )
+        print(
+            f"\n[GARCH-MC] Calibrated on latest {len(cond_vol)} trading days "
+            f"({cond_vol.index[0].date()} to {cond_vol.index[-1].date()})."
         )
         months_ref = pd.date_range(start=SIM_START, end=SIM_END, freq="M")
         monthly_vol_array_garch = daily_vol_to_monthly(fc_vol_daily, months_ref, forecast_start) / 100.0
@@ -675,7 +682,14 @@ def main() -> None:
         all_stats.append(stats_gl)
 
         # ── 3b) Regime-switching MC (two-state, data-driven) ─────────────
-        cond_vol_hist = cond_vol / 100.0
+        # Regime parameters need a complete market cycle, while forward GARCH
+        # volatility remains calibrated on the latest four-year window above.
+        seq_cond_vol_full, _, _ = garch_fit_and_forecast(
+            prices,
+            forecast_horizon=1,
+            calibration_window=None,
+        )
+        cond_vol_hist = seq_cond_vol_full / 100.0
         trans = estimate_regime_transition_matrix(cond_vol_hist)
         daily_ret = prices.pct_change().dropna()
         regime_return_estimates = estimate_regime_returns(daily_ret, cond_vol_hist)

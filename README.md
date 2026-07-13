@@ -39,6 +39,12 @@ All analysis scripts import from `modules/core.py` — no duplicated fetch or mo
 - **Caching**: CSV cache at `sz399932_akshare_cache.csv` with automatic retry (5 attempts, exponential backoff)
 - **Benchmark**: CSI 300 Index (sh000300)
 
+### Data Quality Notes
+
+- **PE/Valuation**: Uses a quality-tagged fallback chain. The currently available tier 2 source is a Moutai price/120-day-MA trend proxy, not a true PE series. Absolute levels are not meaningful and should only be used as a directional valuation signal. Production deployment would use Wind or the official CSIndex PE(TTM) series.
+- **GARCH calibration**: Monte Carlo volatility is calibrated on the latest 1,008 trading days (about four years), matching the terminal rolling window in `modules/rolling_garch.py`. The full rolling analysis remains available for parameter stability monitoring.
+- **Distribution**: GARCH fitting and parametric Monte Carlo shocks use Student's t distribution (`df=5` for MC) to capture fat tails. Historical bootstrap simulation is retained as a non-parametric benchmark.
+
 ## Methodology Choices
 
 ### Why GARCH(1,1) and not EWMA?
@@ -81,12 +87,12 @@ _Key pattern: GARCH time-varying vol produces wider tail risk (fatter left tail,
 ## Limitations (Honest Assessment)
 
 1. **No transaction costs**: Real DCA incurs ~0.03% commission per trade + bid-ask spread
-2. **Single-factor PE proxy**: The ML model uses Moutai PE as a consumer sector valuation proxy — a SIC-based sector aggregate would be more rigorous
+2. **Valuation proxy quality**: Free PE endpoints can fall back to the tier 2 Moutai price/MA trend proxy. It is directional only; production requires Wind or official CSIndex PE(TTM)
 3. **No regime persistence validation**: Markov transition probabilities are calibrated from GARCH conditional vol percentiles, not a proper EM-estimated HMM
 4. **GBM drift assumption**: Long-run mean return μ is assumed constant; real markets exhibit structural breaks
 5. **MC path count**: 10,000 paths balance runtime vs precision; 50,000+ would tighten VaR 99% estimates
 6. **AkShare availability**: Data pipeline falls back to cached CSV when endpoints are unavailable; PE proxy may use trend-based fallback when Moutai PE endpoints return 404
-7. **Stationarity**: GARCH assumes variance stationarity (α+β < 1); rolling analysis shows this occasionally borders on violation
+7. **Stationarity**: GARCH assumes variance stationarity (α+β < 1); rolling analysis monitors persistence and should trigger recalibration if it approaches the unit-root boundary
 
 ## Environment
 

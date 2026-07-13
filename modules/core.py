@@ -174,9 +174,15 @@ def estimate_annual_params(prices: pd.Series) -> tuple[float, float]:
 
 
 def garch_fit_and_forecast(
-    prices: pd.Series, forecast_horizon: int = 252
+    prices: pd.Series,
+    forecast_horizon: int = 252,
+    calibration_window: int | None = None,
 ) -> tuple[pd.Series, np.ndarray, pd.Timestamp]:
-    """Fit GARCH(1,1) on daily log-returns; return historical conditional vol, forward forecast, and forecast start date.
+    """Fit GARCH(1,1) and return conditional volatility plus a forward forecast.
+
+    When ``calibration_window`` is provided, only the most recent observations
+    are used. This matches the terminal window of the rolling GARCH analysis and
+    prevents stale full-history parameters from driving Monte Carlo volatility.
 
     Returns:
         cond_vol_annual: historical daily conditional volatility, annualized (%)
@@ -187,6 +193,10 @@ def garch_fit_and_forecast(
 
     log_returns = np.log(prices).diff()
     returns_pct = (log_returns * 100.0).dropna()
+    if calibration_window is not None:
+        if calibration_window < 100:
+            raise ValueError("GARCH calibration_window must be at least 100 observations.")
+        returns_pct = returns_pct.tail(calibration_window)
     if len(returns_pct) < 100:
         raise ValueError(f"Not enough data for GARCH fitting: {len(returns_pct)} points.")
 
